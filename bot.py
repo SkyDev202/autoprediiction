@@ -6,6 +6,8 @@ import re
 import shutil
 import tempfile
 import time
+import traceback
+from urllib.parse import quote
 import zipfile
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -37,15 +39,18 @@ from telethon.tl.functions.messages import ImportChatInviteRequest
 
 
 BASE_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = BASE_DIR / "config.json"
-SESSION_FILE = BASE_DIR / "userbot"
-STICKER_DIR = BASE_DIR / "stickers"
-IMAGE_DIR = BASE_DIR / "prediction_images"
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data" if os.getenv("RAILWAY_ENVIRONMENT") else str(BASE_DIR))).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_FILE = DATA_DIR / "config.json"
+SESSION_FILE = DATA_DIR / "userbot"
+STICKER_DIR = DATA_DIR / "stickers"
+IMAGE_DIR = DATA_DIR / "prediction_images"
 
 API_URLS = [
     "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json",
 ]
 API_URL = API_URLS[0]
+API_PROXY_URL = os.getenv("API_PROXY_URL", "").strip()
 
 # Deployment credentials live here. Runtime state still uses config.json so
 # subscriptions, channels, and prediction history survive restarts.
@@ -291,6 +296,39 @@ def deep_merge(default, saved):
     return result
 
 
+def normalize_config_state(loaded):
+    for key, default in DEFAULT_CONFIG.items():
+        if loaded.get(key) is None:
+            loaded[key] = deepcopy(default)
+    for key in ["templates", "stats", "martingale", "stickers", "sticker_files", "prediction_images", "channel_assignments", "channel_prediction_images"]:
+        if not isinstance(loaded.get(key), dict):
+            loaded[key] = deepcopy(DEFAULT_CONFIG[key])
+    for key in ["channels", "sessions", "pending_predictions", "history", "completed_session_keys", "api_urls"]:
+        if not isinstance(loaded.get(key), list):
+            loaded[key] = deepcopy(DEFAULT_CONFIG.get(key, []))
+    users = loaded.get("users")
+    if not isinstance(users, dict):
+        users = {}
+        loaded["users"] = users
+    for user_id, profile in list(users.items()):
+        if not isinstance(profile, dict):
+            users[user_id] = {}
+            profile = users[user_id]
+        profile.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+        profile.setdefault("subscription_until", (datetime.now() + timedelta(days=int(loaded.get("trial_days", 2)))).isoformat(timespec="seconds"))
+        profile.setdefault("plan", "free_trial")
+        profile.setdefault("premium_access", False)
+        profile.setdefault("prediction_active", False)
+        profile.setdefault("current_prediction", None)
+        profile.setdefault("last_period_sent", "")
+        for key, default in [("overrides", {}), ("stats", {"total": 0, "wins": 0, "losses": 0})]:
+            if not isinstance(profile.get(key), dict):
+                profile[key] = deepcopy(default)
+        if not isinstance(profile.get("channels"), list):
+            profile["channels"] = []
+    return loaded
+
+
 def load_config():
     if CONFIG_FILE.exists():
         with CONFIG_FILE.open("r", encoding="utf-8") as f:
@@ -298,6 +336,7 @@ def load_config():
         loaded = deep_merge(DEFAULT_CONFIG, saved)
     else:
         loaded = deepcopy(DEFAULT_CONFIG)
+    loaded = normalize_config_state(loaded)
     loaded["bot_token"] = BOT_TOKEN
     loaded["api_id"] = TELEGRAM_API_ID
     loaded["api_hash"] = TELEGRAM_API_HASH
@@ -324,7 +363,12 @@ def create_full_backup():
                 continue
             if item.resolve() == path.resolve() or item.suffix in {".pyc", ".journal"}:
                 continue
-            archive.write(item, item.relative_to(BASE_DIR))
+            archive.write(item, Path("app") / item.relative_to(BASE_DIR))
+        runtime_paths = [CONFIG_FILE, *DATA_DIR.glob("userbot.session*")]
+        runtime_paths.extend(item for folder in [STICKER_DIR, IMAGE_DIR] if folder.exists() for item in folder.rglob("*"))
+        for item in runtime_paths:
+            if item.is_file() and item.suffix not in {".pyc", ".journal"}:
+                archive.write(item, Path("runtime_data") / item.relative_to(DATA_DIR))
     return path
 
 
@@ -343,11 +387,15 @@ def restore_runtime_backup(path):
             if not item.is_file():
                 continue
             relative = item.relative_to(temp_root)
+            if relative.parts[0] == "runtime_data":
+                relative = Path(*relative.parts[1:])
+            elif relative.parts[0] == "app":
+                continue
             root_name = relative.parts[0]
             if root_name not in allowed_roots and not root_name.startswith("userbot.session"):
                 continue
-            target = (BASE_DIR / relative).resolve()
-            if BASE_DIR.resolve() not in target.parents:
+            target = (DATA_DIR / relative).resolve()
+            if DATA_DIR.resolve() not in target.parents:
                 raise ValueError("Unsafe restore target detected")
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, target)
@@ -861,20 +909,26 @@ def fetch_api():
         },
     ]
     for url in config.get("api_urls", API_URLS):
-        for headers in header_profiles:
-            try:
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    params={"pageNo": 1, "pageSize": 20, "ts": int(time.time() * 1000)},
-                    timeout=8,
-                )
-                response.raise_for_status()
-                data = response.json()
-                used_url = url
+        request_urls = [url]
+        if API_PROXY_URL:
+            request_urls.insert(0, API_PROXY_URL.replace("{url}", quote(url, safe="")))
+        for request_url in request_urls:
+            for headers in header_profiles:
+                try:
+                    response = requests.get(
+                        request_url,
+                        headers=headers,
+                        params={"pageNo": 1, "pageSize": 20, "ts": int(time.time() * 1000)} if request_url == url else None,
+                        timeout=8,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    used_url = request_url
+                    break
+                except Exception as exc:
+                    errors.append(f"{request_url}: {exc}")
+            if data is not None:
                 break
-            except Exception as exc:
-                errors.append(f"{url}: {exc}")
         if data is not None:
             break
     if data is None:
@@ -1106,7 +1160,7 @@ async def logout_userbot(delete_session=True):
     save_config()
 
     if delete_session:
-        for path in BASE_DIR.glob("userbot.session*"):
+        for path in DATA_DIR.glob("userbot.session*"):
             try:
                 path.unlink()
             except Exception as exc:
@@ -2340,6 +2394,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"API: {'ONLINE' if api['ok'] else 'ERROR'}\n"
             f"Latest period: {api.get('period', 'Unknown')}\n"
             f"Last success: {api_status.get('last_success') or 'None'}\n"
+            f"Proxy configured: {'YES' if API_PROXY_URL else 'NO'}\n"
             f"Private API error: {(api_status.get('last_error') or 'None')[:350]}\n"
             f"Global engine: {'RUNNING' if config.get('prediction_active') else 'STOPPED'}\n"
             f"Automation jobs: {auto_jobs}\n"
@@ -3024,6 +3079,9 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application: Application):
+    global config
+    config = normalize_config_state(config)
+    save_config()
     api = await asyncio.to_thread(fetch_api)
     if api["ok"] and recover_stale_global_state(api):
         print("Recovered stale global prediction state.")
@@ -3061,6 +3119,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(context.error, BadRequest) and "Message is not modified" in str(context.error):
         return
     print(f"Unhandled bot error: {context.error}")
+    traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
     try:
         if isinstance(update, Update) and update.effective_chat:
             text = f"Something went wrong: {context.error}" if is_admin(update.effective_user.id if update.effective_user else 0) else "Something went wrong. Please try again shortly."
