@@ -43,7 +43,7 @@ API_URL = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json
 
 # Deployment credentials live here. Runtime state still uses config.json so
 # subscriptions, channels, and prediction history survive restarts.
-BOT_TOKEN = "8893208576:AAEdhpGbWSdv2JDhL5B3XkF8tqpVl-LmYUA"
+BOT_TOKEN = "8636559552:AAF6yFKtetqEi4X2N9CghTAR5Mdjd-Pspp8"
 TELEGRAM_API_ID = "39052980"
 TELEGRAM_API_HASH = "5b0b6f9aedd2113a4a591dbcde61be43"
 USERBOT_PHONE = "+1 432 355 7210"
