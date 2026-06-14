@@ -3,7 +3,10 @@ import json
 import os
 import random
 import re
+import shutil
+import tempfile
 import time
+import zipfile
 from copy import deepcopy
 from datetime import datetime, timedelta
 from html import escape
@@ -39,14 +42,17 @@ SESSION_FILE = BASE_DIR / "userbot"
 STICKER_DIR = BASE_DIR / "stickers"
 IMAGE_DIR = BASE_DIR / "prediction_images"
 
-API_URL = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
+API_URLS = [
+    "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json",
+]
+API_URL = API_URLS[0]
 
 # Deployment credentials live here. Runtime state still uses config.json so
 # subscriptions, channels, and prediction history survive restarts.
-BOT_TOKEN = "8636559552:AAF6yFKtetqEi4X2N9CghTAR5Mdjd-Pspp8"
+BOT_TOKEN = "8893208576:AAEdhpGbWSdv2JDhL5B3XkF8tqpVl-LmYUA"
 TELEGRAM_API_ID = "39052980"
 TELEGRAM_API_HASH = "5b0b6f9aedd2113a4a591dbcde61be43"
-USERBOT_PHONE = "+1 432 355 7210"
+USERBOT_PHONE = "916005368965"
 ADMIN_IDS = [8776447116]
 
 DEFAULT_CONFIG = {
@@ -64,6 +70,7 @@ DEFAULT_CONFIG = {
     },
     "users": {},
     "trial_days": 2,
+    "api_urls": API_URLS,
     "prediction_active": False,
     "auto_mode": False,
     "auto_interval": 60,
@@ -198,6 +205,11 @@ EMOJI = {
 config = {}
 user_client = None
 api_cache = {"time": 0.0, "data": None}
+api_status = {"last_error": "", "last_url": "", "last_success": ""}
+
+
+def public_service_error():
+    return "Prediction service is temporarily unavailable. Please try again shortly."
 
 
 def pe(name):
@@ -302,6 +314,47 @@ def save_config():
         json.dump(saved, f, indent=2, ensure_ascii=False)
 
 
+def create_full_backup():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = Path(tempfile.gettempdir()) / f"wingo_full_backup_{timestamp}.zip"
+    excluded = {"__pycache__", ".git"}
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for item in BASE_DIR.rglob("*"):
+            if not item.is_file() or any(part in excluded for part in item.parts):
+                continue
+            if item.resolve() == path.resolve() or item.suffix in {".pyc", ".journal"}:
+                continue
+            archive.write(item, item.relative_to(BASE_DIR))
+    return path
+
+
+def restore_runtime_backup(path):
+    allowed_roots = {"config.json", "stickers", "prediction_images", "userbot.session"}
+    restored = 0
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_root = Path(temp_dir).resolve()
+        with zipfile.ZipFile(path) as archive:
+            for member in archive.infolist():
+                member_path = (temp_root / member.filename).resolve()
+                if temp_root not in member_path.parents and member_path != temp_root:
+                    raise ValueError("Unsafe backup path detected")
+                archive.extract(member, temp_root)
+        for item in temp_root.rglob("*"):
+            if not item.is_file():
+                continue
+            relative = item.relative_to(temp_root)
+            root_name = relative.parts[0]
+            if root_name not in allowed_roots and not root_name.startswith("userbot.session"):
+                continue
+            target = (BASE_DIR / relative).resolve()
+            if BASE_DIR.resolve() not in target.parents:
+                raise ValueError("Unsafe restore target detected")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+            restored += 1
+    return restored
+
+
 def get_user_profile(user_id, create=True):
     user_id = str(user_id)
     users = config.setdefault("users", {})
@@ -403,7 +456,7 @@ async def send_user_profile_prediction(user_id, bot):
 
     api = await asyncio.to_thread(fetch_api)
     if not api["ok"]:
-        return False, f"API error: {api['err']}"
+        return False, public_service_error()
     period = next_period(api["period"])
     if profile.get("last_period_sent") == period:
         return False, f"Prediction already sent for {period}"
@@ -447,7 +500,7 @@ async def verify_user_profile_prediction(user_id, bot):
         return True, "No pending result"
     api = await asyncio.to_thread(fetch_api)
     if not api["ok"]:
-        return False, f"API error: {api['err']}"
+        return False, public_service_error()
     result_record, actual_number = find_result_record(api, current["period"])
     if not result_record:
         if prediction_is_stale(api, current["period"]) or prediction_is_behind_latest(api, current["period"]):
@@ -789,16 +842,48 @@ def fetch_api():
     cached = api_cache.get("data")
     if cached and time.time() - api_cache.get("time", 0) < 1.5:
         return deepcopy(cached)
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
+    errors = []
+    data = None
+    used_url = ""
+    header_profiles = [
+        {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://ar-lottery01.com",
             "Referer": "https://ar-lottery01.com/",
-        }
-        response = requests.get(API_URL, headers=headers, timeout=12)
-        response.raise_for_status()
-        data = response.json()
+            "Cache-Control": "no-cache",
+        },
+        {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36",
+            "Accept": "*/*",
+            "Referer": "https://ar-lottery01.com/",
+        },
+    ]
+    for url in config.get("api_urls", API_URLS):
+        for headers in header_profiles:
+            try:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params={"pageNo": 1, "pageSize": 20, "ts": int(time.time() * 1000)},
+                    timeout=8,
+                )
+                response.raise_for_status()
+                data = response.json()
+                used_url = url
+                break
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
+        if data is not None:
+            break
+    if data is None:
+        error = " | ".join(errors[-3:]) or "API request failed"
+        api_status["last_error"] = error
+        print(f"API private error: {error}")
+        return {"ok": False, "err": error}
 
+    try:
         records = None
         if isinstance(data, dict):
             data_obj = data.get("data")
@@ -826,8 +911,12 @@ def fetch_api():
         result = {"ok": True, "period": period, "number": number, "raw": latest, "records": records[:20]}
         api_cache["time"] = time.time()
         api_cache["data"] = result
+        api_status["last_error"] = ""
+        api_status["last_url"] = used_url
+        api_status["last_success"] = datetime.now().isoformat(timespec="seconds")
         return deepcopy(result)
     except Exception as exc:
+        api_status["last_error"] = str(exc)
         return {"ok": False, "err": str(exc)}
 
 
@@ -1176,7 +1265,7 @@ async def send_prediction(bot=None, wait_until=None):
 
     api = await asyncio.to_thread(fetch_api)
     if not api["ok"]:
-        return False, f"API error: {api['err']}"
+        return False, public_service_error()
 
     period = next_period(api["period"])
     if config.get("last_period_sent") == period:
@@ -1243,7 +1332,7 @@ async def verify_prediction(bot=None):
 
     api = await asyncio.to_thread(fetch_api)
     if not api["ok"]:
-        return False, f"API error: {api['err']}"
+        return False, public_service_error()
 
     result_record, actual_number = find_result_record(api, current["period"])
     if not result_record:
@@ -2137,8 +2226,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [btn("Default Sender Routing", "bot_menu", "shield")],
                 [btn("Default Interval", "set_interval", "candle"), btn("Trial Duration", "set_trial_days", "free")],
                 [btn("Restart Automation Jobs", "restart_jobs", "comet", "success")],
+                [btn("Set API Endpoint / Mirror", "set_api_url", "link", "primary")],
                 [btn("Stop All User Predictions", "stop_all_users", "stop", "danger")],
                 [btn("Repair Prediction State", "repair_state", "warn", "success")],
+                [btn("Download Full Backup", "backup_download", "shop", "success"), btn("Restore Backup", "backup_restore", "comet")],
                 [btn("Emergency Stop Everything", "emergency_stop", "stop", "danger")],
                 [back_btn()],
             ]
@@ -2153,6 +2244,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_trial_days":
         context.user_data["awaiting"] = "trial_days"
         await query.edit_message_text("Send default free-trial duration in days.\nThis applies to newly registered users.", reply_markup=InlineKeyboardMarkup([[back_btn("system_menu")]]))
+
+    elif data == "set_api_url":
+        context.user_data["awaiting"] = "api_url"
+        await query.edit_message_text(
+            "Send the allowed API endpoint or mirror URL.\nUse this when the provider blocks Railway's datacenter IP.",
+            reply_markup=InlineKeyboardMarkup([[back_btn("system_menu")]]),
+        )
+
+    elif data == "backup_download":
+        await query.edit_message_text("Preparing encrypted transport package...")
+        backup_path = create_full_backup()
+        try:
+            with backup_path.open("rb") as document:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=document,
+                    filename=backup_path.name,
+                    caption="Admin-only full bot backup. Keep this file private.",
+                )
+        finally:
+            backup_path.unlink(missing_ok=True)
+        await query.edit_message_text("Full backup sent privately to this admin chat.", reply_markup=InlineKeyboardMarkup([[back_btn("system_menu")]]))
+
+    elif data == "backup_restore":
+        context.user_data["awaiting"] = "backup_restore"
+        await query.edit_message_text(
+            "Send the ZIP backup file now.\n\nThis replaces runtime data, stickers, images, and session files. Credentials remain from bot.py.",
+            reply_markup=InlineKeyboardMarkup([[back_btn("system_menu")]]),
+        )
 
     elif data == "stop_all_users":
         stopped = 0
@@ -2192,7 +2312,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "repair_state":
         api = await asyncio.to_thread(fetch_api)
         if not api["ok"]:
-            await query.edit_message_text(f"Repair failed: {api['err']}", reply_markup=InlineKeyboardMarkup([[back_btn("system_menu")]]))
+            await query.edit_message_text("Repair could not run because the prediction API is offline. See Live System Health.", reply_markup=InlineKeyboardMarkup([[back_btn("system_menu")]]))
             return
         changed = recover_stale_global_state(api)
         for user_id, profile in config.get("users", {}).items():
@@ -2219,6 +2339,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Live System Health\n\n"
             f"API: {'ONLINE' if api['ok'] else 'ERROR'}\n"
             f"Latest period: {api.get('period', 'Unknown')}\n"
+            f"Last success: {api_status.get('last_success') or 'None'}\n"
+            f"Private API error: {(api_status.get('last_error') or 'None')[:350]}\n"
             f"Global engine: {'RUNNING' if config.get('prediction_active') else 'STOPPED'}\n"
             f"Automation jobs: {auto_jobs}\n"
             f"Running users: {running}\n"
@@ -2740,6 +2862,22 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Send trial duration as a number.")
         return
 
+    if awaiting == "api_url":
+        url = text.strip()
+        if not re.match(r"^https://[^ ]+$", url):
+            await update.message.reply_text("Send a valid HTTPS API URL.")
+            return
+        config["api_urls"] = [url]
+        api_cache["data"] = None
+        context.user_data.pop("awaiting", None)
+        save_config()
+        api = await asyncio.to_thread(fetch_api)
+        await update.message.reply_text(
+            "API endpoint saved and verified." if api["ok"] else "API endpoint saved, but Railway is still being blocked. Check Live System Health.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
     if awaiting == "sessions":
         sessions = [part.strip() for part in re.split(r"[\n,]+", text) if part.strip()]
         valid = []
@@ -2859,6 +2997,32 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"{size} prediction image saved and enabled for {scope}.", reply_markup=main_keyboard())
 
 
+@admin_only
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting") != "backup_restore":
+        await update.message.reply_text("Documents are accepted only through System Controls > Restore Backup.")
+        return
+    document = update.message.document
+    if not document.file_name or not document.file_name.lower().endswith(".zip"):
+        await update.message.reply_text("Send a valid ZIP backup file.")
+        return
+    temp_path = Path(tempfile.gettempdir()) / f"restore_{update.effective_user.id}_{int(time.time())}.zip"
+    file = await context.bot.get_file(document.file_id)
+    await file.download_to_drive(custom_path=temp_path)
+    try:
+        restored = await asyncio.to_thread(restore_runtime_backup, temp_path)
+        context.user_data.pop("awaiting", None)
+        await update.message.reply_text(
+            f"Backup restored successfully: {restored} runtime file(s).\nRestart the Railway service once to reload all restored data.",
+            reply_markup=main_keyboard(),
+        )
+    except Exception as exc:
+        print(f"Backup restore private error: {exc}")
+        await update.message.reply_text("Backup restore failed. The file is invalid or unsafe.")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 async def post_init(application: Application):
     api = await asyncio.to_thread(fetch_api)
     if api["ok"] and recover_stale_global_state(api):
@@ -2899,9 +3063,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"Unhandled bot error: {context.error}")
     try:
         if isinstance(update, Update) and update.effective_chat:
+            text = f"Something went wrong: {context.error}" if is_admin(update.effective_user.id if update.effective_user else 0) else "Something went wrong. Please try again shortly."
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"Something went wrong: {context.error}",
+                text=text,
             )
     except Exception as exc:
         print(f"Error handler failed: {exc}")
@@ -2931,6 +3096,7 @@ def main():
     app.add_handler(CommandHandler("premium", grant_premium))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_handler))
     app.add_handler(MessageHandler(filters.FORWARDED, forwarded_channel_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
